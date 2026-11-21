@@ -1,0 +1,833 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum SchoolType {
+  PRIMARY
+  SECONDARY
+  CUSTOM
+}
+
+enum AcademicYearStatus {
+  DRAFT
+  ACTIVE
+  COMPLETED
+}
+
+enum GradeScope {
+  SELECTED_GRADES
+  ALL_GRADES
+}
+
+enum TeacherSubjectType {
+  PRIMARY
+  SECONDARY
+}
+
+enum DayOfWeek {
+  MONDAY
+  TUESDAY
+  WEDNESDAY
+  THURSDAY
+  FRIDAY
+  SATURDAY
+  SUNDAY
+}
+
+enum ScheduleEventType {
+  BREAK
+  LUNCH
+  ASSEMBLY
+  OTHER
+}
+
+model School {
+  id         String     @id @default(uuid())
+  name       String
+  code       String     @unique
+  schoolType SchoolType @default(CUSTOM)
+  // Migration 20261102090000. How a SUBSTITUTE (cover) may be given four or more consecutive teaching periods. It only judges the run a cover would join; it
+  // changes nothing about the normal timetable's own constraints and is not a weekly workload limit.
+  consecutivePeriodPolicy ConsecutivePeriodPolicy @default(PREFER_AVOID)
+
+  admins        Admin[]
+  academicYears AcademicYear[]
+  teachers      Teacher[]
+  subjects      Subject[]
+
+  teacherBulkRequests     TeacherBulkRequest[]
+  teacherAbsences         TeacherAbsence[]
+  teacherUnavailabilities TeacherUnavailability[]
+  coverRequests           CoverRequest[]
+  coverEvents             CoverEvent[]
+  timetableVersions       TimetableVersion[]
+  timetableGenerationRuns TimetableGenerationRun[]
+  setupToken              SchoolSetupToken?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("schools")
+}
+
+model Admin {
+  id           String @id @default(uuid())
+  schoolId     String
+  name         String
+  email        String
+  passwordHash String
+
+  school   School         @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  sessions AdminSession[]
+
+  timetableVersions          TimetableVersion[]       @relation("CreatedTimetableVersions")
+  publishedTimetableVersions TimetableVersion[]       @relation("PublishedTimetableVersions")
+  timetableGenerationRuns    TimetableGenerationRun[]
+  consumedSetupTokens        SchoolSetupToken[]       @relation("SetupTokenConsumer")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([schoolId, email])
+  @@map("admins")
+}
+
+// The single-use credential that authorizes the FIRST admin of a school (issued when the school is created, or by the operator-run
+// recovery command). Only the SHA-256 hash of the token is stored; the raw token is shown once. One row per school (UNIQUE schoolId): a
+// rotation replaces the row. The CHECK constraints are in the migration SQL (Prisma cannot express them).
+model SchoolSetupToken {
+  id                String    @id @default(uuid())
+  schoolId          String    @unique
+  tokenHash         String    @unique
+  expiresAt         DateTime  @db.Timestamptz(3)
+  consumedAt        DateTime? @db.Timestamptz(3)
+  consumedByAdminId String?
+  createdAt         DateTime  @default(now()) @db.Timestamptz(3)
+
+  school          School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  consumedByAdmin Admin? @relation("SetupTokenConsumer", fields: [consumedByAdminId], references: [id], onDelete: SetNull)
+
+  @@index([consumedByAdminId])
+  @@map("school_setup_tokens")
+}
+
+model AdminSession {
+  id           String   @id @default(uuid())
+  adminId      String
+  sessionToken String   @unique
+  expiresAt    DateTime
+  lastUsedAt   DateTime @default(now())
+
+  admin Admin @relation(fields: [adminId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([sessionToken])
+  @@index([adminId])
+  @@map("admin_sessions")
+}
+
+model AcademicYear {
+  id        String             @id @default(uuid())
+  schoolId  String
+  name      String
+  startDate DateTime
+  endDate   DateTime
+  status    AcademicYearStatus @default(DRAFT)
+
+  school         School          @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  grades         Grade[]
+  scheduleConfig ScheduleConfig?
+
+  timetableVersions       TimetableVersion[]
+  timetableGenerationRuns TimetableGenerationRun[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([schoolId, name])
+  @@map("academic_years")
+}
+
+model Grade {
+  id             String @id @default(uuid())
+  academicYearId String
+  name           String
+  displayOrder   Int
+
+  academicYear         AcademicYear          @relation(fields: [academicYearId], references: [id], onDelete: Cascade)
+  streams              Stream[]
+  sections             Section[]
+  teacherSubjectGrades TeacherSubjectGrade[]
+  subjectRequirements  SubjectRequirement[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([academicYearId, name])
+  @@unique([academicYearId, displayOrder])
+  @@map("grades")
+}
+
+model Stream {
+  id      String @id @default(uuid())
+  gradeId String
+  name    String
+  code    String
+
+  grade               Grade                @relation(fields: [gradeId], references: [id], onDelete: Cascade)
+  sections            Section[]
+  subjectRequirements SubjectRequirement[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([gradeId, code])
+  @@map("streams")
+}
+
+model Section {
+  id       String  @id @default(uuid())
+  gradeId  String
+  streamId String?
+  name     String
+  code     String
+
+  grade  Grade   @relation(fields: [gradeId], references: [id], onDelete: Cascade)
+  stream Stream? @relation(fields: [streamId], references: [id], onDelete: SetNull)
+
+  sectionSubjectTeachers SectionSubjectTeacher[]
+  timetableEntries       TimetableEntry[]
+  coverRequests          CoverRequest[]
+  requirementScopes      SubjectRequirementSection[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Uniqueness is enforced by two partial indexes in the migration SQL
+  // (Prisma DSL does not support partial/conditional unique indexes)
+  // Index 1 (WHERE streamId IS NULL):  UNIQUE(gradeId, code)
+  // Index 2 (WHERE streamId IS NOT NULL): UNIQUE(gradeId, streamId, code)
+  @@map("sections")
+}
+
+model Subject {
+  id       String @id @default(uuid())
+  schoolId String
+  name     String
+  code     String
+
+  school              School               @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  teacherSubjects     TeacherSubject[]
+  subjectRequirements SubjectRequirement[]
+  timetableEntries    TimetableEntry[]
+  coverRequests       CoverRequest[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([schoolId, code])
+  @@map("subjects")
+}
+
+// Request-level idempotency for POST /api/teachers/bulk. The row is inserted in the SAME transaction as the teachers it describes, so it exists
+// if and only if those teachers were created. UNIQUE (schoolId, idempotencyKey) makes concurrent requests with one key serialise on the index;
+// requestHash detects the same key being reused with a different body; response is the original 201 payload, replayed on a retry.
+model TeacherBulkRequest {
+  id             String   @id @default(uuid())
+  schoolId       String
+  idempotencyKey String
+  requestHash    String
+  response       Json
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+
+  school School @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  @@unique([schoolId, idempotencyKey])
+  @@map("teacher_bulk_requests")
+}
+
+model Teacher {
+  id           String  @id @default(uuid())
+  schoolId     String
+  name         String
+  employeeCode String?
+  isActive     Boolean @default(true)
+
+  school          School           @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  teacherSubjects TeacherSubject[]
+
+  createdAt              DateTime                @default(now())
+  updatedAt              DateTime                @updatedAt
+  sectionSubjectTeachers SectionSubjectTeacher[]
+  timetableEntries       TimetableEntry[]
+
+  absences                 TeacherAbsence[]
+  unavailabilities         TeacherUnavailability[]
+  coversAsAbsent           CoverRequest[]          @relation("CoverAbsentTeacher")
+  coversAsReplacement      CoverRequest[]          @relation("CoverReplacementTeacher")
+
+  @@unique([schoolId, employeeCode])
+  @@map("teachers")
+}
+
+model TeacherSubject {
+  id         String             @id @default(uuid())
+  teacherId  String
+  subjectId  String
+  type       TeacherSubjectType
+  // Which grades the teacher may teach this subject in. SELECTED_GRADES (the default, and what every link was before this column existed):
+  // only the grades with an explicit teacher_subject_grades row for the academic year. ALL_GRADES: every grade, by an explicit, recorded
+  // admin choice (the grade rows are then not required and are ignored). Subject qualification (this row's existence) is always required.
+  gradeScope GradeScope         @default(SELECTED_GRADES)
+
+  teacher Teacher @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+  subject Subject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+
+  grades TeacherSubjectGrade[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([teacherId, subjectId])
+  @@map("teacher_subjects")
+}
+
+model TeacherSubjectGrade {
+  id               String @id @default(uuid())
+  teacherSubjectId String
+  gradeId          String
+
+  teacherSubject TeacherSubject @relation(fields: [teacherSubjectId], references: [id], onDelete: Cascade)
+  grade          Grade          @relation(fields: [gradeId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([teacherSubjectId, gradeId])
+  @@map("teacher_subject_grades")
+}
+
+enum RequirementScope {
+  ALL_SECTIONS
+  SELECTED_SECTIONS
+}
+
+model SubjectRequirement {
+  id        String  @id @default(uuid())
+  gradeId   String
+  streamId  String?
+  subjectId String
+
+  periodsPerWeek Int
+
+  // Curriculum metadata (migration 20261024090000). Both default to the behaviour every requirement had before they existed.
+  // isOptional is a LABEL: an optional subject is scheduled exactly like a compulsory one (it still needs its periods in every applicable
+  // section); electives that split a section into parallel groups are not modelled.
+  isOptional Boolean @default(false)
+  // ALL_SECTIONS: every section of the grade/stream (the original meaning). SELECTED_SECTIONS: only the sections listed in `sections`
+  // (which must belong to this requirement's grade and stream; enforced in the service and by a trigger).
+  sectionScope RequirementScope @default(ALL_SECTIONS)
+
+  grade   Grade   @relation(fields: [gradeId], references: [id], onDelete: Cascade)
+  stream  Stream? @relation(fields: [streamId], references: [id], onDelete: Cascade)
+  subject Subject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+
+  sections               SubjectRequirementSection[]
+  sectionSubjectTeachers SectionSubjectTeacher[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // The unique key above only protects STREAMED requirements: PostgreSQL treats NULL
+  // streamIds as distinct. Non-streamed uniqueness and the periodsPerWeek > 0 check are
+  // enforced in the migration SQL (Prisma DSL cannot express partial indexes / CHECKs):
+  //   UNIQUE(gradeId, subjectId) WHERE streamId IS NULL
+  //   CHECK (periodsPerWeek > 0)
+  @@unique([gradeId, streamId, subjectId])
+  @@index([gradeId])
+  @@index([streamId])
+  @@map("subject_requirements")
+}
+
+/// The sections a SELECTED_SECTIONS requirement applies to. Rows exist only while the requirement's scope is SELECTED_SECTIONS.
+model SubjectRequirementSection {
+  id                   String @id @default(uuid())
+  subjectRequirementId String
+  sectionId            String
+
+  requirement SubjectRequirement @relation(fields: [subjectRequirementId], references: [id], onDelete: Cascade)
+  section     Section            @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([subjectRequirementId, sectionId])
+  @@index([sectionId])
+  @@map("subject_requirement_sections")
+}
+
+model SectionSubjectTeacher {
+  id                   String @id @default(uuid())
+  sectionId            String
+  subjectRequirementId String
+  teacherId            String
+
+  section            Section            @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+  subjectRequirement SubjectRequirement @relation(fields: [subjectRequirementId], references: [id], onDelete: Cascade)
+  teacher            Teacher            @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([sectionId, subjectRequirementId])
+  @@index([teacherId])
+  @@map("section_subject_teachers")
+}
+
+model ScheduleConfig {
+  id             String @id @default(uuid())
+  academicYearId String
+
+  periodsPerDay Int
+  // Migration 20261117090000. The simplified schedule model: exactly ONE break per working day, placed after this teaching period (1..periodsPerDay-1).
+  // NULL = a legacy configuration (made before the simplification) with zero or several timing events: it keeps working from its stored timing-event
+  // positions until an admin saves the simplified form. The legacy tables schedule_periods / schedule_timing_events are READ-ONLY history: nothing writes them
+  // any more and no scheduling code reads their clock times.
+  breakAfterPeriod Int?
+
+  academicYear AcademicYear @relation(fields: [academicYearId], references: [id], onDelete: Cascade)
+
+  days         ScheduleDay[]
+  periods      SchedulePeriod[]
+  timingEvents ScheduleTimingEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // CHECK (periodsPerDay > 0) and CHECK (breakAfterPeriod IS NULL OR 1 <= breakAfterPeriod < periodsPerDay) are in the migration SQL (Prisma DSL cannot express CHECKs).
+  // The upper bound (12) is enforced in the application.
+  @@unique([academicYearId])
+  @@map("schedule_configs")
+}
+
+// A row means "this is a working day" for the config. Non-working days have no row.
+// The DayOfWeek enum sorts Monday..Sunday, so ORDER BY dayOfWeek gives the week order.
+model ScheduleDay {
+  id               String    @id @default(uuid())
+  scheduleConfigId String
+  dayOfWeek        DayOfWeek
+
+  scheduleConfig ScheduleConfig @relation(fields: [scheduleConfigId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([scheduleConfigId, dayOfWeek])
+  @@map("schedule_days")
+}
+
+// One teaching period of the (single) daily grid, shared by every working day.
+// Times are minutes since midnight (school-local wall clock); the API exposes "HH:mm".
+// CHECKs in the migration: periodNumber >= 1 and 0 <= startMinute < endMinute <= 1439.
+// Non-overlap / contiguity of period numbers is validated in the service.
+model SchedulePeriod {
+  id               String @id @default(uuid())
+  scheduleConfigId String
+
+  periodNumber Int
+  startMinute  Int
+  endMinute    Int
+
+  scheduleConfig ScheduleConfig @relation(fields: [scheduleConfigId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([scheduleConfigId, periodNumber])
+  @@map("schedule_periods")
+}
+
+// A non-teaching timing event (break, lunch, assembly, ...). It is NOT a teaching period and
+// does not count towards periodsPerDay. afterPeriodNumber anchors it to the gap after that
+// period (0 = before period 1, periodsPerDay = after the last period); the service validates
+// that it fits inside that gap. Display / export data only: the scheduler ignores it.
+// CHECKs in the migration: afterPeriodNumber >= 0 and 0 <= startMinute < endMinute <= 1439.
+model ScheduleTimingEvent {
+  id                String            @id @default(uuid())
+  scheduleConfigId  String
+  eventType         ScheduleEventType
+  label             String?
+  afterPeriodNumber Int
+  startMinute       Int
+  endMinute         Int
+
+  scheduleConfig ScheduleConfig @relation(fields: [scheduleConfigId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([scheduleConfigId, afterPeriodNumber])
+  @@map("schedule_timing_events")
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Module 11 - timetable generation (Phase 4: persistence only; no behaviour lives in the database).
+//
+// Hand-written parts of the migration (Prisma's DSL cannot express them, and `migrate diff` does not see them):
+//   * UNIQUE INDEX timetable_generation_runs_one_active_per_year ON (academicYearId) WHERE status IN ('QUEUED','RUNNING')
+//   * CHECK timetable_versions_version_number_check  (versionNumber >= 1)
+//   * CHECK timetable_entries_period_number_check    (periodNumber >= 1)
+// ---------------------------------------------------------------------------------------------------------------
+
+enum TimetableVersionStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum TimetableEntrySource {
+  GENERATED
+  MANUAL
+}
+
+enum TimetableRunStatus {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+enum SolutionSource {
+  CP_SAT
+  BASELINE
+}
+
+// The CP-SAT outcome stored with a SUCCESSFUL version. INFEASIBLE is deliberately absent: it is a failed run.
+enum SolverStatus {
+  OPTIMAL
+  FEASIBLE
+  UNKNOWN
+}
+
+// One generated timetable of an academic year. A generation always creates a NEW version; nothing is overwritten.
+model TimetableVersion {
+  id             String                 @id @default(uuid())
+  schoolId       String
+  academicYearId String
+  versionNumber  Int
+  status         TimetableVersionStatus @default(DRAFT)
+
+  solutionSource SolutionSource
+  solverStatus   SolverStatus
+  weightsVersion String
+
+  // The immutable snapshot the timetable was generated from, and its hash (staleness detection).
+  inputHash     String
+  inputSnapshot Json
+
+  // AUTHORITATIVE metrics, computed by the backend evaluator from the entries; the baseline's metrics for comparison.
+  metrics           Json
+  baselineMetrics   Json
+  // Solver-reported numbers (objective, bound, wall time, seed, workers, OR-Tools version): diagnostic only. Null when the
+  // baseline was used because the solver process was killed and produced no document.
+  solverDiagnostics Json?
+
+  createdById String?
+
+  // Publishing (Phase 7). `revision` is the optimistic-concurrency token: it starts at 1 and every successful mutation of
+  // the version (move, swap, lock change, publish, archive) increments it. The status/metadata CHECK and the
+  // one-published-per-academic-year partial unique index are in the migration SQL (Prisma cannot express them).
+  revision      Int       @default(1)
+  publishedAt   DateTime? @db.Timestamptz(3)
+  archivedAt    DateTime? @db.Timestamptz(3)
+  publishedById String?
+
+  // Phase 7F-0. clonedFromId: provenance of a cloned draft (the version it was copied from; set null if that version is deleted). The
+  // same-year/same-school rule is a trigger in the migration SQL. periodTimes: the school-local period times the timetable was generated
+  // under, frozen from the run's first-attempt configuration snapshot ([{periodNumber, startMinute, endMinute}]); null for versions that
+  // predate 7F. The two period-time columns are both set or both null (CHECK in the migration SQL).
+  clonedFromId          String?
+  periodTimes           Json?
+  periodTimesCapturedAt DateTime? @db.Timestamptz(3)
+
+  school        School                  @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  academicYear  AcademicYear            @relation(fields: [academicYearId], references: [id], onDelete: Cascade)
+  createdBy     Admin?                  @relation("CreatedTimetableVersions", fields: [createdById], references: [id], onDelete: SetNull)
+  publishedBy   Admin?                  @relation("PublishedTimetableVersions", fields: [publishedById], references: [id], onDelete: SetNull)
+  clonedFrom    TimetableVersion?       @relation("VersionClones", fields: [clonedFromId], references: [id], onDelete: SetNull)
+  clones        TimetableVersion[]      @relation("VersionClones")
+  entries       TimetableEntry[]
+  generationRun TimetableGenerationRun?
+  coverRequests CoverRequest[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // CHECK (versionNumber >= 1) is in the migration SQL.
+  @@unique([academicYearId, versionNumber])
+  @@index([schoolId])
+  @@index([clonedFromId])
+  @@map("timetable_versions")
+}
+
+// One lesson period of a version, keyed by the LOGICAL slot (dayOfWeek + periodNumber), never by schedule-row ids
+// (Module 9 replaces those rows). subjectRequirementId is a logical reference without a foreign key: the version is a
+// snapshot and the requirement may change or disappear later.
+model TimetableEntry {
+  id                   String               @id @default(uuid())
+  versionId            String
+  sectionId            String
+  subjectId            String
+  teacherId            String
+  subjectRequirementId String
+  dayOfWeek            DayOfWeek
+  periodNumber         Int
+  source               TimetableEntrySource @default(GENERATED)
+  isLocked             Boolean              @default(false)
+
+  version TimetableVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  section Section          @relation(fields: [sectionId], references: [id], onDelete: NoAction)
+  subject Subject          @relation(fields: [subjectId], references: [id], onDelete: NoAction)
+  teacher Teacher          @relation(fields: [teacherId], references: [id], onDelete: NoAction)
+
+  // CHECK (periodNumber >= 1) is in the migration SQL.
+  @@unique([versionId, sectionId, dayOfWeek, periodNumber])
+  @@unique([versionId, teacherId, dayOfWeek, periodNumber])
+  @@index([sectionId])
+  @@index([teacherId])
+  @@index([subjectId])
+  @@map("timetable_entries")
+}
+
+// One generation request and its lifecycle: QUEUED -> RUNNING -> SUCCEEDED | FAILED (Phase 4 defines storage only;
+// the transitions, claiming, leases and recovery belong to the later runner). The partial unique index in the migration
+// guarantees at most one QUEUED or RUNNING run per academic year, enforced by PostgreSQL itself.
+model TimetableGenerationRun {
+  id             String             @id @default(uuid())
+  schoolId       String
+  academicYearId String
+  requestedById  String?
+  status         TimetableRunStatus @default(QUEUED)
+  phase          String?
+  attempts       Int                @default(0)
+
+  leaseOwner     String?
+  leaseExpiresAt DateTime?
+  heartbeatAt    DateTime?
+
+  options          Json
+  timeLimitSeconds Int
+  workers          Int
+  sectionCount     Int
+  inputHash        String?
+
+  failureCode        String?
+  failureMessage     String?
+  failureDiagnostics Json?
+
+  versionId     String? @unique
+  resultSummary Json?
+
+  // Phase 7F-0: the period times captured from the FIRST attempt's consistent configuration snapshot, write-once (a recovered attempt
+  // reuses them) and copied to the version the run creates. Both set or both null (CHECK in the migration SQL).
+  periodTimes           Json?
+  periodTimesCapturedAt DateTime? @db.Timestamptz(3)
+
+  school       School            @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  academicYear AcademicYear      @relation(fields: [academicYearId], references: [id], onDelete: Cascade)
+  requestedBy  Admin?            @relation(fields: [requestedById], references: [id], onDelete: SetNull)
+  version      TimetableVersion? @relation(fields: [versionId], references: [id], onDelete: SetNull)
+
+  createdAt  DateTime  @default(now())
+  startedAt  DateTime?
+  finishedAt DateTime?
+  updatedAt  DateTime  @updatedAt
+
+  // UNIQUE (academicYearId) WHERE status IN ('QUEUED','RUNNING') is in the migration SQL.
+  @@index([status, createdAt])
+  @@index([schoolId, academicYearId, createdAt])
+  @@map("timetable_generation_runs")
+}
+
+
+// ===========================================================================================================================================
+// Substitution (teacher absence -> lessons needing cover -> replacement). The source of lessons is ALWAYS the school's PUBLISHED timetable
+// version; drafts are never used. Rules that Prisma cannot express (CHECKs, partial unique indexes) are in the migration SQL.
+// ===========================================================================================================================================
+enum AbsenceScope {
+  FULL_DAY
+  PERIODS
+}
+
+/// ACTIVE or CANCELLED (soft: the record and who cancelled it are kept).
+enum RecordStatus {
+  ACTIVE
+  CANCELLED
+}
+
+enum CoverStatus {
+  OPEN
+  ASSIGNED
+  CANCELLED
+  OBSOLETE
+}
+
+enum CoverEventAction {
+  CREATED
+  ASSIGNED
+  REASSIGNED
+  UNASSIGNED
+  CANCELLED
+  OBSOLETED
+  AUTO_ASSIGNED // the automatic allocator chose the replacement
+  AUTO_UNFILLED // the automatic allocator found nobody it may assign (needs the admin)
+  AUTO_RELEASED // the allocator released its own assignment (its substitute became absent/unavailable)
+}
+
+/// ALLOW: four in a row is fine. PREFER_AVOID: avoid it while another teacher can take the lesson, accept it as a last resort. NEVER_ALLOW: never.
+enum ConsecutivePeriodPolicy {
+  ALLOW
+  PREFER_AVOID
+  NEVER_ALLOW
+}
+
+/// Who made the current ASSIGNED decision. An admin's choice (MANUAL) is never overwritten by the allocator.
+enum CoverAssignmentSource {
+  MANUAL
+  AUTOMATIC
+}
+
+/// A teacher is absent from startDate to endDate (inclusive calendar dates, no time zone). FULL_DAY: every period. PERIODS: only fromPeriod..toPeriod
+/// of each day of the range. An inactive teacher is NOT automatically absent: only an explicit record is.
+model TeacherAbsence {
+  id         String       @id @default(uuid())
+  schoolId   String
+  teacherId  String
+  startDate  DateTime     @db.Date
+  endDate    DateTime     @db.Date
+  scope      AbsenceScope
+  fromPeriod Int?
+  toPeriod   Int?
+  reason     String?
+  status     RecordStatus @default(ACTIVE)
+
+  createdById   String?
+  updatedById   String?
+  cancelledById String?
+  cancelledAt   DateTime? @db.Timestamptz(3)
+
+  school  School  @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  teacher Teacher @relation(fields: [teacherId], references: [id], onDelete: NoAction)
+  covers  CoverRequest[]
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  @@index([schoolId, status, endDate])
+  @@index([teacherId, startDate])
+  @@map("teacher_absences")
+}
+
+/// A teacher who is NOT absent but cannot take cover on a date (whole day when periodNumber is null, or one period).
+model TeacherUnavailability {
+  id           String       @id @default(uuid())
+  schoolId     String
+  teacherId    String
+  date         DateTime     @db.Date
+  periodNumber Int?
+  reason       String?
+  status       RecordStatus @default(ACTIVE)
+
+  createdById   String?
+  cancelledById String?
+  cancelledAt   DateTime? @db.Timestamptz(3)
+
+  school  School  @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  teacher Teacher @relation(fields: [teacherId], references: [id], onDelete: NoAction)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([schoolId, date])
+  @@index([teacherId, date])
+  @@map("teacher_unavailabilities")
+}
+
+/// One lesson of the PUBLISHED timetable that needs cover on one date. The lesson data is a snapshot taken from timetableVersionId, so history stays
+/// readable after a newer version is published (the request then becomes OBSOLETE and a new one is created from the new version).
+model CoverRequest {
+  id                 String      @id @default(uuid())
+  schoolId           String
+  absenceId          String
+  timetableVersionId String
+  sourceEntryId      String? // the timetable entry it came from (no foreign key: informational)
+  date               DateTime    @db.Date
+  dayOfWeek          DayOfWeek
+  periodNumber       Int
+  sectionId          String
+  subjectId          String
+  absentTeacherId    String
+  status             CoverStatus @default(OPEN)
+
+  replacementTeacherId String?
+  assignedById         String?
+  assignedAt           DateTime? @db.Timestamptz(3)
+  cancelledById        String?
+  cancelledAt          DateTime? @db.Timestamptz(3)
+  cancelReason         String?
+  obsoleteAt           DateTime? @db.Timestamptz(3)
+  supersedesId         String? // the OBSOLETE request this one replaces after a new timetable version
+  // Migration 20261101090000. Set while ASSIGNED, cleared on unassign: who decided, and whether the replacement is a TEMPORARY, UNQUALIFIED cover
+  // (no subject link / no lesson of the subject): purely descriptive, no teacher-subject link or grade eligibility is ever created.
+  assignmentSource     CoverAssignmentSource?
+  temporaryUnqualified Boolean                @default(false)
+  // Why the automatic allocator left this OPEN request for the admin (null when not applicable); cleared when it is assigned/cancelled.
+  attentionCode        String?
+  attentionNote        String?
+
+  school             School           @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  absence            TeacherAbsence   @relation(fields: [absenceId], references: [id], onDelete: Cascade)
+  timetableVersion   TimetableVersion @relation(fields: [timetableVersionId], references: [id], onDelete: NoAction)
+  section            Section          @relation(fields: [sectionId], references: [id], onDelete: NoAction)
+  subject            Subject          @relation(fields: [subjectId], references: [id], onDelete: NoAction)
+  absentTeacher      Teacher          @relation("CoverAbsentTeacher", fields: [absentTeacherId], references: [id], onDelete: NoAction)
+  replacementTeacher Teacher?         @relation("CoverReplacementTeacher", fields: [replacementTeacherId], references: [id], onDelete: NoAction)
+  events             CoverEvent[]
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  // Migration SQL (not expressible here): one request per absence/version/lesson/date; at most ONE live (OPEN or ASSIGNED) request per lesson and
+  // date; a replacement can hold at most ONE ASSIGNED request per date and period; OPEN has no replacement, ASSIGNED has one, never the absent teacher.
+  @@unique([absenceId, timetableVersionId, sectionId, date, periodNumber])
+  @@index([schoolId, date, status])
+  @@index([absenceId])
+  @@index([timetableVersionId])
+  @@index([replacementTeacherId, date])
+  @@map("cover_requests")
+}
+
+/// Append-only audit trail of a cover request: who did what, when, and the status/teacher transition.
+model CoverEvent {
+  id             String           @id @default(uuid())
+  schoolId       String
+  coverRequestId String
+  action         CoverEventAction
+  fromStatus     CoverStatus?
+  toStatus       CoverStatus
+  fromTeacherId  String?
+  toTeacherId    String?
+  actorAdminId   String? // null for system actions (automatic creation, obsolescence, automatic allocation)
+  note           String?
+  details        Json? // why: the ranking facts of an automatic choice, or the reason nobody could be assigned
+
+  school       School       @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  coverRequest CoverRequest @relation(fields: [coverRequestId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([coverRequestId, createdAt])
+  @@map("cover_events")
+}

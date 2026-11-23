@@ -65,7 +65,15 @@ prisma.config.d.ts.map
 .claude/skills/
 .claude/settings.local.json
 
+# Local tooling, screenshots and test output
+.playwright-mcp/
+playwright-report/
+test-results/
+screenshots/
+
 # Python (the solver)
+.pytest_cache/
+.mypy_cache/
 solver/.venv/
 __pycache__/
 *.pyc

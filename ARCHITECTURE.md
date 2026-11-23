@@ -1,587 +1,191 @@
-# System Architecture
+# Architecture
 
-## High-Level Overview
+This document describes how the backend is built today. For setup and day-to-day commands see
+[DEVELOPMENT.md](DEVELOPMENT.md); for each feature's endpoints and rules see the `README.md` inside the module folders.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                         Frontend                             │
-│                   (Next.js - Separate Repo)                  │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ HTTP/REST
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│                      BACKEND API                             │
-│                  (Node.js + Fastify)                         │
-│                                                               │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │                   API Layer                           │  │
-│  │  - CORS                                               │  │
-│  │  - Cookie/Session                                     │  │
-│  │  - Request Validation                                 │  │
-│  │  - Error Handling                                     │  │
-│  └──────────────────────────────────────────────────────┘  │
-│                           │                                   │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │              Module Layer (Modular Monolith)         │  │
-│  │                                                        │  │
-│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐             │  │
-│  │  │ School   │ │  Admin   │ │ Academic │             │  │
-│  │  │ Module   │ │ Module   │ │   Year   │  ...        │  │
-│  │  └────┬─────┘ └────┬─────┘ └────┬─────┘             │  │
-│  │       │            │            │                     │  │
-│  │  ┌────▼────────────▼────────────▼─────┐             │  │
-│  │  │     Common Services & Utils         │             │  │
-│  │  │  - Error Handler                    │             │  │
-│  │  │  - Validation                       │             │  │
-│  │  │  - Types                            │             │  │
-│  │  └─────────────────┬───────────────────┘             │  │
-│  └──────────────────────┼───────────────────────────────┘  │
-│                         │                                   │
-│  ┌──────────────────────▼───────────────────────────────┐  │
-│  │              Database Layer (Prisma ORM)             │  │
-│  │  - Schema Management                                  │  │
-│  │  - Query Builder                                      │  │
-│  │  - Type Safety                                        │  │
-│  │  - Migration System                                   │  │
-│  └──────────────────────┬───────────────────────────────┘  │
-└─────────────────────────┼───────────────────────────────────┘
-                          │ pg adapter
-                          ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   PostgreSQL Database                        │
-│                     (Neon Serverless)                        │
-└─────────────────────────────────────────────────────────────┘
+## 1. Overview
 
-                          │ (Future)
-                          ▼
-┌─────────────────────────────────────────────────────────────┐
-│                  Scheduler Service                           │
-│                (Python + OR-Tools CP-SAT)                    │
-│                   (Separate Process)                         │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Request Flow
-
-### Typical API Request Flow
+A single Node.js process serves a REST API (Fastify, TypeScript) backed by PostgreSQL (Prisma). Timetable solving runs in a
+separate Python process (OR-Tools CP-SAT) that the Node process starts on demand. There is no message broker: the database is
+also the job queue for timetable generation.
 
 ```
-1. Client Request
-   │
-   ▼
-2. Fastify Router
-   │
-   ▼
-3. Route Handler (routes file)
-   │
-   ▼
-4. Controller Method
-   │ - Parse request
-   │ - Validate with Zod
-   │
-   ▼
-5. Service Method
-   │ - Business logic
-   │ - Validation
-   │
-   ▼
-6. Prisma Query
-   │ - Type-safe query
-   │ - Parameter binding
-   │
-   ▼
-7. PostgreSQL
-   │
-   ▼
-8. Prisma Result
-   │ - Type-safe result
-   │
-   ▼
-9. Service Return
-   │ - Domain object
-   │
-   ▼
-10. Controller Response
-    │ - Format API response
-    │ - Set status code
-    │
-    ▼
-11. Client Response
-    - JSON response
+ Frontend (separate repo)
+        │  HTTP/JSON, session cookie
+        ▼
+ ┌──────────────────────────────── Node.js process ────────────────────────────────┐
+ │  Fastify app (src/app.ts)                                                       │
+ │    CORS · cookies · Swagger (/docs) · /health · /api/* routes                   │
+ │      route → authMiddleware → controller (Zod) → service (rules + Prisma)       │
+ │                                                                                 │
+ │  Generation runner (in the same process, started by src/server.ts)              │
+ │    polls the queue table → claims a run → spawns ──────────────┐                │
+ └───────────────────────────────┬─────────────────────────────────│───────────────┘
+                                 │ Prisma + pg pool                │ JSON on stdin/stdout
+                                 ▼                                 ▼
+                           PostgreSQL                     Python solver (solver/main.py)
+                                                          OR-Tools CP-SAT, no DB, no network
 ```
 
-### Error Flow
+| Layer | Technology |
+|---|---|
+| HTTP | Fastify 5, `@fastify/cookie`, `@fastify/cors`, `@fastify/swagger` and swagger-ui |
+| Validation | Zod 4 in the controllers |
+| Data access | Prisma 7 with the `pg` driver adapter (`src/config/database.ts`) |
+| Database | PostgreSQL; schema and migrations in `prisma/` |
+| Solver | Python, OR-Tools CP-SAT (`solver/`) |
 
-```
-1. Error Occurs (any layer)
-   │
-   ▼
-2. Caught in Controller try/catch
-   │
-   ▼
-3. handleError() utility
-   │ - Identify error type
-   │ - Format response
-   │ - Set status code
-   │
-   ▼
-4. Client Error Response
-   - Consistent format
-   - User-friendly message
-   - Field-level errors (if validation)
-```
+## 2. Request lifecycle
 
----
+1. `buildApp()` (`src/app.ts`) validates the security configuration first (`COOKIE_SECRET`, `TRUST_PROXY`,
+   `SETUP_TOKEN_TTL_HOURS`); an invalid value stops start-up. It then registers CORS (origin from `FRONTEND_URL`, credentials on),
+   cookies, Swagger, `GET /health` and every module's routes under the `/api` prefix.
+2. A route declares its Swagger schema and a `preHandler`: `authMiddleware` for authenticated routes, plus a rate limiter for the
+   public ones.
+3. The controller parses the body, query and params with Zod and calls the service. Validation failures become a `400` with
+   field-level `errors`.
+4. The service applies the business rules and talks to Prisma, often inside a transaction.
+5. The controller returns the standard envelope; thrown errors pass through `handleError` (section 8).
 
-## Module Architecture
+`src/server.ts` is the process entry point: it connects to the database, builds the app, listens on `PORT`/`HOST`, starts the
+generation runner (unless `GENERATION_RUNNER_ENABLED=false`) and, on `SIGINT`/`SIGTERM`, stops the runner (running generations
+are requeued) and disconnects Prisma.
 
-### School Module (Example)
+## 3. Authentication and school isolation
 
-```
-src/modules/school/
-│
-├── school.schema.ts
-│   └── Zod validation schemas
-│       - CreateSchoolInput
-│       - GetSchoolParams
-│       - Type exports
-│
-├── school.service.ts
-│   └── Business logic
-│       - createSchool()
-│       - getSchoolById()
-│       - Database operations
-│       - Business rule enforcement
-│
-├── school.controller.ts
-│   └── HTTP handlers
-│       - createSchool()
-│       - getSchool()
-│       - Request parsing
-│       - Response formatting
-│
-├── school.routes.ts
-│   └── Route definitions
-│       - POST /schools
-│       - GET /schools/:id
-│       - Route registration
-│
-└── README.md
-    └── API documentation
-```
+- **Accounts**: a school is created with `POST /api/schools`, which returns a one-time setup token. The first admin registers
+  with that token (`POST /api/admin/register`); further admins are added by an authenticated admin (`POST /api/admins`). The token
+  is stored only as a SHA-256 hash, is consumed atomically and expires (`SETUP_TOKEN_TTL_HOURS`). An operator can issue a new one
+  with the `setup-token` CLI.
+- **Passwords**: hashed with PBKDF2 (SHA-512), `src/utils/password.ts`.
+- **Sessions**: login creates a random token, sets it in an `HttpOnly` cookie named `session_token` (7 days; `Secure` and
+  `SameSite=Strict` in production, `Lax` otherwise) and stores only its SHA-256 hash in `admin_sessions`.
+- **`authMiddleware`** reads the cookie, validates the session and attaches `request.admin` (`id`, `schoolId`, `email`, `name`).
+  A missing or invalid session is `401`.
+- **Isolation**: services never accept a school id from the client. They use `request.admin.schoolId` and check that every
+  referenced record belongs to that school: an unknown id is `404`, a record of another school is `403`. There is a single admin
+  role; every admin of a school has the same permissions.
+- **Rate limits** (in memory, per client address and per process): login 5 per 15 minutes, admin registration 3 per hour, school
+  creation 1 per 24 hours. `TRUST_PROXY` controls which proxy headers determine the client address; run one instance, or enforce
+  limits at the proxy as well.
 
-### Module Interaction Pattern
+## 4. Module organisation
 
-```
-┌─────────────────────────────────────────────────┐
-│              school.routes.ts                   │
-│  - Defines endpoints                            │
-│  - Maps URLs to controller methods              │
-└─────────────────┬───────────────────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────────────────┐
-│           school.controller.ts                  │
-│  - Receives FastifyRequest                      │
-│  - Validates with school.schema.ts              │
-│  - Calls school.service.ts                      │
-│  - Returns FastifyReply                         │
-└─────────────────┬───────────────────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────────────────┐
-│            school.service.ts                    │
-│  - Business logic                               │
-│  - Database operations via Prisma               │
-│  - Domain rule enforcement                      │
-│  - Returns domain objects                       │
-└─────────────────┬───────────────────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────────────────┐
-│          config/database.ts                     │
-│  - Prisma Client instance                       │
-│  - Connection pooling                           │
-│  - Query execution                              │
-└─────────────────────────────────────────────────┘
-```
+Each feature lives in `src/modules/<name>/` and follows the same layering:
 
----
+| File | Role |
+|---|---|
+| `<name>.routes.ts` | Route registration, Swagger schemas, `preHandler` |
+| `<name>.controller.ts` | Zod parsing, status codes, response envelope |
+| `<name>.service.ts` | Business rules and Prisma access |
+| `<name>.schema.ts` | Zod schemas and inferred types |
 
-## Data Flow
+Larger modules split pure logic into `*.core.ts` files (no database, no clock) so the rules can be tested exhaustively.
 
-### Create School Flow
+| Group | Modules |
+|---|---|
+| Identity | `school`, `admin` |
+| School structure | `academic-year`, `grade`, `stream`, `section`, `subject`, `teacher`, `teacher-subject`, `teacher-subject-grade` |
+| Teaching configuration | `subject-requirement`, `section-subject-teacher`, `curriculum` |
+| Schedule | `schedule-config` |
+| Timetabling | `timetable-feasibility`, `timetable-generation`, `timetable-version` |
+| Substitution | `substitution` |
+| Record management | `record-deletion` (dependency-checked deletion and deactivation; history is retired, not erased) |
 
-```
-Client
-  │
-  │ POST /api/schools
-  │ { name, code, schoolType }
-  │
-  ▼
-Fastify Router
-  │
-  ▼
-school.routes.ts
-  │ app.post('/schools', ...)
-  │
-  ▼
-school.controller.ts
-  │ createSchool(request, reply)
-  │
-  ├─▶ school.schema.ts
-  │   │ createSchoolSchema.parse()
-  │   └─▶ Validated data
-  │
-  ▼
-school.service.ts
-  │ createSchool(data)
-  │
-  ├─▶ Check if code exists
-  │   │ prisma.school.findUnique()
-  │   └─▶ Conflict? Throw AppError
-  │
-  ├─▶ Create school
-  │   │ prisma.school.create()
-  │   └─▶ New school object
-  │
-  ▼
-Controller formats response
-  │ { success: true, data: school }
-  │
-  ▼
-Client receives 201 with data
-```
+Shared code: `src/config` (database client, Swagger, security configuration), `src/middleware` (authentication, rate limiting),
+`src/types` (envelope types), `src/utils` (errors, password and token helpers).
 
----
+## 5. Data access (Prisma and PostgreSQL)
 
-## Technology Stack Details
+- One shared `PrismaClient` over a `pg` pool (`src/config/database.ts`): connection timeout 20 s, TCP keep-alive, connections
+  recycled after 30 minutes, pool errors logged without connection details.
+- Models: `School`, `Admin`, `SchoolSetupToken`, `AdminSession`, `AcademicYear`, `Grade`, `Stream`, `Section`, `Subject`,
+  `Teacher`, `TeacherSubject`, `TeacherSubjectGrade`, `SubjectRequirement` (+ per-section scope), `SectionSubjectTeacher`,
+  `ScheduleConfig` (+ days, periods, timing events), `TimetableVersion`, `TimetableEntry`, `TimetableGenerationRun`,
+  `TeacherAbsence`, `TeacherUnavailability`, `CoverRequest`, `CoverEvent`, `TeacherBulkRequest`.
+- Every table that belongs to a school carries `schoolId`. Academic years have the status `DRAFT`, `ACTIVE` or `COMPLETED`.
+- Concurrency is handled in the database: transactions, row locks (`FOR UPDATE` / `FOR SHARE`), advisory locks, partial unique
+  indexes and optimistic `revision` numbers, rather than in application memory. Several invariants (for example one active
+  generation run per academic year) are enforced by partial unique indexes written in the migration SQL.
+- Schema changes are SQL migrations in `prisma/migrations/`.
 
-### Backend Layer
+## 6. Timetable generation
 
-```
-┌─────────────────────────────────────┐
-│          Application                │
-│  - Node.js 24.x                     │
-│  - TypeScript 6.x                   │
-│  - ES Modules                       │
-└─────────────────┬───────────────────┘
-                  │
-┌─────────────────▼───────────────────┐
-│         Web Framework               │
-│  - Fastify 5.x                      │
-│  - @fastify/cors                    │
-│  - @fastify/cookie                  │
-└─────────────────┬───────────────────┘
-                  │
-┌─────────────────▼───────────────────┐
-│        Validation Layer             │
-│  - Zod 4.x                          │
-│  - Type-safe schemas                │
-└─────────────────┬───────────────────┘
-                  │
-┌─────────────────▼───────────────────┐
-│         ORM Layer                   │
-│  - Prisma 7.x                       │
-│  - @prisma/adapter-pg               │
-│  - pg (connection pool)             │
-└─────────────────┬───────────────────┘
-                  │
-┌─────────────────▼───────────────────┐
-│          Database                   │
-│  - PostgreSQL 14+                   │
-│  - Neon Serverless                  │
-└─────────────────────────────────────┘
-```
+### Schedule model
+A school's weekly schedule (`schedule-config`) is: working days, periods per day and one break position per day
+(`breakAfterPeriod`). There are no clock times. The break is not a teaching period; it only ends a run of consecutive lessons.
+Older configurations and versions that still carry clock times remain readable.
 
----
+### Lifecycle of a generation
+1. **Request**: `POST /api/timetable-generations` validates the request and queues a run (`QUEUED`), returning `202` with a
+   `Location` header. Nothing is solved inside the request. Runs can also start from an existing draft with locked lessons.
+2. **Queue**: the database is the queue. The runner (`timetable-generation.runner.ts`) ticks periodically, claims runs under a
+   lease it keeps alive with a heartbeat, and limits concurrency. A run whose worker died is recovered when its lease expires; a
+   graceful shutdown requeues it without consuming an attempt. At most one run per academic year is active at a time.
+3. **Execution** (`timetable-generation.orchestrator.ts`), one clock for the whole run:
+   fresh consistent snapshot of the year (REPEATABLE READ) → year must be `DRAFT` → feasibility must be `READY` →
+   normalisation into the immutable solver problem and its input hash → a validated TypeScript baseline timetable →
+   solver subprocess with the remaining time budget → interpretation → validation → independent metrics.
+4. **Persistence** (`timetable-generation.final-persist.ts`), one transaction: fence on the run's lease, lock everything the problem
+   depends on, re-read the configuration, and re-check that its hash equals the hash of the problem that was solved
+   (otherwise `CONFIGURATION_CHANGED` and nothing is written), re-validate, enforce the per-year draft cap, then write a new
+   `DRAFT` version with its entries and mark the run `SUCCEEDED`.
 
-## Separation of Concerns
+Nothing is trusted from enqueue time: the snapshot, feasibility check and hash are recomputed when the run executes.
 
-### Layer Responsibilities
+### Python solver integration
+`timetable-generation.solver-client.ts` starts `solver/main.py` (the interpreter defaults to `solver/.venv/bin/python`; override
+with `SOLVER_PYTHON` and `SOLVER_ENTRYPOINT`) and exchanges one JSON document each way over stdin/stdout. The contract is defined in
+`timetable-generation.contracts.ts` on the TypeScript side and mirrored in `solver/timetable_solver/contract.py`; a test fails if
+they drift. The solver has no database or network access. The Node side decides what a failure means: only a clean `UNKNOWN`
+result or a watchdog kill may fall back to the validated baseline (`solutionSource = BASELINE`); a crash, an unavailable solver or
+invalid output fails the run.
 
-| Layer | Responsibility | Does NOT Handle |
-|-------|---------------|-----------------|
-| **Routes** | Define endpoints, map to controllers | Business logic, validation, database |
-| **Controllers** | Parse requests, call services, format responses | Business rules, direct database access |
-| **Services** | Business logic, data operations | HTTP concerns, response formatting |
-| **Schemas** | Input/output validation | Business rules, data persistence |
-| **Database** | Data persistence, queries | Business logic, HTTP concerns |
+### Snapshots and versions
+A `TimetableVersion` stores the exact input it was generated from (`inputSnapshot`, `inputHash`), the weights version, solver
+status and diagnostics, and its metrics next to the baseline's. Versions are numbered per academic year. A version is `DRAFT`,
+`PUBLISHED` or `ARCHIVED`:
 
-### File Responsibilities
+- Only drafts can be edited (move or swap a lesson), locked, deleted or published. Edits are validated in full and use an
+  `expectedRevision` check.
+- Publishing makes a version `PUBLISHED` and archives the previous published one in the same transaction. It is refused when the
+  timetable is invalid or stale.
+- **Staleness** uses one strict rule: the live configuration, freshly normalised, must hash to the version's stored hash.
+- Published and archived versions are immutable history. Cloning copies a version into a new draft with provenance.
+- Views of a version (per section or per teacher) are built from the stored data; legacy versions with stored period times keep
+  showing them.
 
-```
-server.ts
-  - Start server
-  - Database connection
-  - Graceful shutdown
-  
-app.ts
-  - Configure Fastify
-  - Register plugins
-  - Register routes
-  - Define middleware
-  
-*.routes.ts
-  - Map HTTP methods to paths
-  - Register route handlers
-  - NO business logic
-  
-*.controller.ts
-  - Parse/validate requests
-  - Call service methods
-  - Format responses
-  - Handle errors
-  
-*.service.ts
-  - Business logic
-  - Database operations
-  - Domain rules
-  - Throw AppError on issues
-  
-*.schema.ts
-  - Zod validation schemas
-  - Type definitions
-  - Input/output contracts
-  
-utils/errors.ts
-  - AppError class
-  - handleError function
-  - Error type identification
-  - Consistent error responses
-```
+## 7. Substitution workflow
 
----
+Backend only; the source of lessons is always the school's **published** timetable version.
 
-## Database Schema Architecture
+1. An admin records a teacher absence (or unavailability). Cover requests (`CoverRequest`) are created for the affected lessons of
+   the published version for each date. A cover request is a snapshot of one lesson on one date.
+2. Substitutes are assigned automatically (`substitution.auto.ts`, with the pure allocator in `substitution.allocator.ts`), one
+   transaction per day, serialised per school. Hard constraints: same school, active, not absent, not unavailable, not teaching or
+   covering in that period. Candidates are ranked by subject match, grade eligibility, weekly workload, covers that day,
+   consecutive run length and recent covers.
+3. A school setting, `consecutivePeriodPolicy` (`ALLOW`, `PREFER_AVOID` default, `NEVER_ALLOW`), controls how four consecutive
+   periods are treated. A manual assignment or reassignment re-runs the same checks and is recorded as an event; automatic allocation
+   only touches `OPEN` requests, so it never overwrites an existing assignment, manual or automatic.
+4. Publishing a new version reconciles cover requests: requests tied to a version that is no longer published become `OBSOLETE`
+   (history kept) and new ones are created and allocated.
+5. Every change writes a `CoverEvent`, which also feeds the events endpoint.
 
-### Entity Relationships
+See [src/modules/substitution/README.md](src/modules/substitution/README.md) for the rules and endpoints.
 
-```
-School (1) ──┬──▶ (N) Admin
-             │
-             ├──▶ (N) AcademicYear
-             │       │
-             │       └──▶ (N) Grade
-             │               │
-             │               ├──▶ (N) Stream
-             │               │       │
-             │               │       └──▶ (N) Section
-             │               │
-             │               └──▶ (N) Section (no stream)
-             │
-             ├──▶ (N) Teacher
-             │       │
-             │       └──▶ (N) TeacherSubject
-             │               │
-             │               └──▶ (N) TeacherSubjectGrade
-             │
-             └──▶ (N) Subject
-                     │
-                     └──▶ (N) SubjectRequirement
-                             │
-                             └──▶ (N) SectionSubjectTeacher
-```
+## 8. Errors and validation
 
-### Access Control Pattern
+- Input is validated with Zod in the controllers; Prisma parameterises every query.
+- Services throw `AppError(statusCode, message, errors?)`. `handleError` (`src/utils/errors.ts`) turns Zod errors into `400`,
+  `AppError` into its status, known Prisma errors (for example a unique violation) into `409`, and everything else into a generic
+  `500` so internals are never leaked.
+- Success: `{ "success": true, "message": "...", "data": ... }`. Error: `{ "success": false, "message": "...", "errors"?: ... }`.
+  `GET /health` is the one endpoint with a different shape.
+- Status codes in use: `200`, `201`, `202` (generation queued), `400`, `401`, `403`, `404`, `409`, `429` (rate limited), `500`.
 
-```
-Every resource is scoped to a School
-    │
-    ├──▶ Admin belongs to School
-    │     └──▶ Can only access their School's resources
-    │
-    ├──▶ AcademicYear belongs to School
-    │     └──▶ Grade belongs to AcademicYear
-    │           └──▶ Section belongs to Grade
-    │
-    └──▶ Subject belongs to School
-          └──▶ SubjectRequirement references Subject
-```
+## 9. Testing structure
 
----
-
-## Security Architecture
-
-### Current Implementation
-
-```
-┌─────────────────────────────────────┐
-│         Client Request              │
-└─────────────────┬───────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────┐
-│           CORS Check                │
-│  - Origin validation                │
-│  - Credentials handling             │
-└─────────────────┬───────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────┐
-│      Input Validation (Zod)         │
-│  - Type checking                    │
-│  - Format validation                │
-│  - Required fields                  │
-└─────────────────┬───────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────┐
-│     Database Query (Prisma)         │
-│  - Parameterized queries            │
-│  - Type-safe operations             │
-│  - Automatic SQL injection          │
-│    prevention                        │
-└─────────────────┬───────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────┐
-│       Response Sanitization         │
-│  - No stack traces                  │
-│  - No internal errors               │
-│  - Consistent format                │
-└─────────────────────────────────────┘
-```
-
-### Authentication Layer (implemented in Module 2)
-
-```
-Client Request
-  │
-  ▼
-┌─────────────────────────────────────┐
-│      Authentication Check           │
-│  - Verify session cookie            │
-│  - Load admin from session          │
-│  - Reject if not authenticated      │
-└─────────────────┬───────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────┐
-│      Authorization Check            │
-│  - Verify resource ownership        │
-│  - Check admin's school ID          │
-│  - Reject if not authorized         │
-└─────────────────┬───────────────────┘
-                  │
-                  ▼
-            Route Handler
-```
-
----
-
-## Development Workflow
-
-### Adding a New Module
-
-```
-1. Create folder
-   src/modules/{module-name}/
-
-2. Create schema
-   {module}.schema.ts
-   - Zod validation
-   - TypeScript types
-
-3. Create service
-   {module}.service.ts
-   - Business logic
-   - Database operations
-
-4. Create controller
-   {module}.controller.ts
-   - Request handlers
-   - Error handling
-
-5. Create routes
-   {module}.routes.ts
-   - Endpoint definitions
-
-6. Register routes
-   src/app.ts
-   - Import and register
-
-7. Test
-   - Create test script
-   - Manual testing
-   - Validate all cases
-
-8. Document
-   - Create README.md
-   - Update main docs
-```
-
----
-
-## Deployment Architecture (Future)
-
-```
-┌─────────────────────────────────────┐
-│        Load Balancer                │
-└─────────────────┬───────────────────┘
-                  │
-        ┌─────────┴─────────┐
-        │                   │
-        ▼                   ▼
-┌──────────────┐    ┌──────────────┐
-│   Backend    │    │   Backend    │
-│  Instance 1  │    │  Instance 2  │
-└──────┬───────┘    └──────┬───────┘
-       │                   │
-       └─────────┬─────────┘
-                 │
-                 ▼
-┌─────────────────────────────────────┐
-│      PostgreSQL (Neon)              │
-│  - Connection pooling               │
-│  - Automatic scaling                │
-└─────────────────────────────────────┘
-```
-
----
-
-## Performance Considerations
-
-### Database Access
-
-- ✅ Connection pooling via pg
-- ✅ Prepared statements via Prisma
-- ✅ Indexed fields in schema
-- ⏳ Query optimization (when needed)
-- ⏳ Caching layer (when needed)
-
-### API Performance
-
-- ✅ Fast framework (Fastify)
-- ✅ Efficient JSON serialization
-- ⏳ Response compression (future)
-- ✅ Rate limiting (in-memory, per IP, on login/registration/school creation)
-- ⏳ CDN for static assets (future)
-
----
-
-## Scalability Strategy
-
-### Horizontal Scaling
-- Stateless API servers
-- Session in database/Redis
-- Load balancer distributes traffic
-
-### Database Scaling
-- Neon handles connection pooling
-- Read replicas (if needed)
-- Query optimization
-- Proper indexing
-
-### Caching Strategy (Future)
-- Redis for session storage
-- Cache frequently accessed data
-- Invalidation strategy
-
----
-
-**Last Updated**: September 28, 2026  
-**Architecture Version**: 1.0  
-**Status**: Modular Monolith - Production Ready for MVP
+Pure-logic tests (`test-*-core.ts`) need no database. API and database tests build the app with `buildApp()` and call it with
+`app.inject()` against a disposable local `*_test` database, and refuse to run against anything else. `e2e/dashboard/` provides
+that disposable database and a backend on port 4010. The solver has its own `unittest` suite. See [DEVELOPMENT.md](DEVELOPMENT.md).

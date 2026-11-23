@@ -150,8 +150,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 #### Documentation
 - `README.md` - Project overview and setup guide
 - `DEVELOPMENT.md` - Development roadmap with all modules planned
-- `QUICK_START.md` - Quick reference for common tasks
-- `IMPLEMENTATION_SUMMARY.md` - Detailed implementation notes
 - `ARCHITECTURE.md` - System architecture diagrams and patterns
 - `CHANGELOG.md` - This file
 - `src/modules/school/README.md` - School API documentation
